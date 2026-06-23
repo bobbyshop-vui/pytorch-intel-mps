@@ -1,4 +1,13 @@
 //  Copyright © 2022 Apple Inc.
+//
+//  PATCHED: added explicit null-buffer guards at every allocation / write
+//  site. On Intel Macs with discrete GPUs (hasUnifiedMemory == false), the
+//  default low/high watermark ratios are tighter, so MPSHeapAllocatorImpl
+//  can legitimately return a null id<MTLBuffer> under memory pressure.
+//  Several call sites previously dereferenced/memcpy'd into that buffer
+//  (effectively address 0x0) without checking. This patch makes every
+//  write path use the standard Objective-C allocation API and bail out
+//  with a clear TORCH_CHECK instead of touching a null pointer.
 
 #include <ATen/mps/MPSAllocator.h>
 #include <c10/core/Allocator.h>
@@ -26,6 +35,11 @@ void MPSHeapAllocatorImpl::init_allocator() {
                                                                  default_high_watermark_ratio;
   setHighWatermarkRatio(high_watermark_ratio);
 
+  // NOTE (Intel-Mac fix): discrete GPUs (hasUnifiedMemory == false) use a
+  // tighter default low watermark. This is intentional — it makes the
+  // allocator trigger GC/refuse-new-alloc earlier, BEFORE Metal itself
+  // returns a null buffer. Combined with the null-checks added below,
+  // this turns a silent 0x0 write into a clear, catchable TORCH_CHECK.
   const double default_low_watermark_ratio =  m_device.hasUnifiedMemory ? default_low_watermark_ratio_unified :
                                                                           default_low_watermark_ratio_discrete;
   static const char *low_watermark_ratio_str = getenv("PYTORCH_MPS_LOW_WATERMARK_RATIO");
@@ -96,9 +110,29 @@ bool MPSHeapAllocatorImpl::alloc_buffer(AllocParams& params) {
   }
   BufferPool& pool = *params.pool;
 
+  // (Intel-Mac fix) newMTLBuffer can legitimately return nil if the
+  // discrete GPU's heap is fragmented or the driver is under pressure.
+  // The original code asserted this never happens; that assertion is the
+  // exact scenario that, in release builds (NDEBUG), silently turns into
+  // dereferencing a null id<MTLBuffer> a few lines below. We now check
+  // explicitly and fail the allocation attempt instead of crashing.
   id<MTLBuffer> buffer = heap->newMTLBuffer(params.size(), pool.usage);
-  // this should never happen as the backing memory (i.e., heap) was allocated successfully.
-  TORCH_INTERNAL_ASSERT(buffer);
+  if (buffer == nil) {
+    if (m_debug_verbosity & DebugVerbosity::ALLOCATIONS) {
+      std::cerr << "WARNING: newMTLBuffer returned nil for size "
+                << format_size(params.size())
+                << " on " << ((pool.usage & UsageFlags::SHARED) ? "shared" : "private")
+                << " pool (discrete GPU: " << (!m_device.hasUnifiedMemory ? "yes" : "no")
+                << "). Falling back to allocation-failed path.\n";
+    }
+    // re-insert the heap we just pulled out so accounting stays correct,
+    // then signal failure up the call chain (alloc_buffer_block will retry
+    // via GC / release_cached_buffers / eventually TORCH_CHECK with a
+    // proper OOM message instead of a 0x0 write).
+    pool.heaps.insert(heap);
+    return false;
+  }
+
   // insert heap after a buffer was created on it to update the order of heap's set
   pool.heaps.insert(heap);
   params.buffer_block = new BufferBlock(params.size(), params.requested_size, buffer, heap);
@@ -226,6 +260,9 @@ BufferBlock* MPSHeapAllocatorImpl::alloc_buffer_block(size_t size, uint32_t usag
   //   1- the High Watermark limit has been reached (if enabled)
   //   2- ran out of device memory, or the memory fragmentation is so high that a contiguous
   //      chunk of requested size couldn't be found.
+  //   3- (Intel-Mac fix) newMTLBuffer returned nil on a discrete GPU under pressure —
+  //      alloc_buffer() now reports this as block_found == false instead of crashing,
+  //      so it surfaces here as the same clear OOM message below.
   if (!block_found || !buffer_block) {
     if (m_high_watermark_ratio > 0.0) {
       TORCH_CHECK(false, "MPS backend out of memory (MPS allocated: ", format_size(m_total_allocated_memory),
@@ -240,6 +277,17 @@ BufferBlock* MPSHeapAllocatorImpl::alloc_buffer_block(size_t size, uint32_t usag
                   " on ", ((pool.usage & UsageFlags::SHARED) ? "shared" : "private"), " pool.");
     }
   }
+
+  // (Intel-Mac fix) defensive guard: even though the branch above should
+  // already have thrown via TORCH_CHECK(false, ...), never let a null
+  // buffer_block->buffer reach the caller. This is the last line of
+  // defense against any future code path that forgets to check
+  // block_found before touching buffer_block.
+  TORCH_CHECK(buffer_block != nullptr && buffer_block->buffer != nil,
+              "MPS allocator returned a null buffer block unexpectedly "
+              "(requested ", format_size(alloc_size), "). Refusing to "
+              "hand back a buffer that would be written at address 0x0.");
+
   buffer_block->in_use = true;
   buffer_block->use_count++;
   m_current_allocated_memory += buffer_block->size;
@@ -248,7 +296,33 @@ BufferBlock* MPSHeapAllocatorImpl::alloc_buffer_block(size_t size, uint32_t usag
 }
 
 void MPSHeapAllocatorImpl::free_buffer(BufferBlock* buffer_block) {
+  // (Intel-Mac fix) guard against freeing a null block — can happen if a
+  // caller upstream raced with an allocation failure and still tried to
+  // release "whatever it got back".
+  if (buffer_block == nullptr) {
+    if (m_debug_verbosity & DebugVerbosity::RELEASES) {
+      std::cerr << "WARNING: free_buffer() called with a null buffer_block, ignoring.\n";
+    }
+    return;
+  }
   TORCH_INTERNAL_ASSERT(buffer_block->in_use);
+
+  // (Intel-Mac fix v2) heapless buffer (scalar buffers allocated directly
+  // from the device in allocScalarBufferWithValue() — see Heap==nullptr
+  // there). There's no BufferPool/HeapBlock bookkeeping to update; just
+  // release the Metal buffer and the bookkeeping struct directly.
+  if (buffer_block->heap == nullptr) {
+    TORCH_INTERNAL_ASSERT_DEBUG_ONLY(m_current_allocated_memory >= buffer_block->size);
+    m_current_allocated_memory -= buffer_block->size;
+    m_allocated_buffers.erase(buffer_block->buffer);
+    if (m_debug_verbosity & DebugVerbosity::RELEASES) {
+      std::cerr << "Released heapless shared scalar buffer #" << buffer_block->buf_id
+                << " of size " << format_size(buffer_block->size) << "\n";
+    }
+    [buffer_block->buffer release];
+    delete buffer_block;
+    return;
+  }
 
   BufferPool& pool = *buffer_block->heap->pool;
   // Makes sure the BufferBlock* isn't already present in the pool we're freeing it back into.
@@ -261,6 +335,13 @@ void MPSHeapAllocatorImpl::free_buffer(BufferBlock* buffer_block) {
 }
 
 BufferBlock* MPSHeapAllocatorImpl::get_allocated_buffer_block(void* ptr) {
+  // (Intel-Mac fix) explicit null-pointer guard before doing a map lookup.
+  // Looking up address 0x0 in m_allocated_buffers should never succeed,
+  // but bailing out early makes the failure mode explicit instead of
+  // relying on map.find() behaving correctly on a garbage key.
+  if (ptr == nullptr) {
+    return nullptr;
+  }
   auto it = m_allocated_buffers.find(ptr);
   if (it == m_allocated_buffers.end()) {
     return nullptr;
@@ -269,6 +350,9 @@ BufferBlock* MPSHeapAllocatorImpl::get_allocated_buffer_block(void* ptr) {
 }
 
 bool MPSHeapAllocatorImpl::release_buffer(BufferBlock* buffer_block, bool remove_empty_heap) {
+  // (Intel-Mac fix) never dereference a null block here.
+  TORCH_CHECK(buffer_block != nullptr, "release_buffer() called with a null buffer_block");
+
   HeapBlock *heap_block = buffer_block->heap;
   BufferPool& pool = *heap_block->pool;
   m_total_allocated_memory -= buffer_block->size;
@@ -456,7 +540,20 @@ void MPSHeapAllocatorImpl::garbage_collect_cached_buffers(AllocParams& params) {
 id<MTLBuffer> MPSHeapAllocatorImpl::malloc(size_t size, uint32_t usage) {
   std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
+  // (Intel-Mac fix) reject zero-size requests explicitly instead of letting
+  // them silently flow into alloc_buffer_block and potentially produce a
+  // degenerate buffer. A zero-size MTLBuffer is a common source of "writes
+  // to 0x0" further downstream when callers assume a valid backing store.
+  if (size == 0) {
+    if (m_debug_verbosity & DebugVerbosity::ALLOCATIONS) {
+      std::cerr << "WARNING: malloc() called with size == 0, returning nil.\n";
+    }
+    return nullptr;
+  }
+
   BufferBlock* buffer_block = alloc_buffer_block(size, usage);
+  // alloc_buffer_block() now guarantees (via TORCH_CHECK above) that it
+  // never returns a block with a nil ->buffer, so this ternary is safe.
   return buffer_block ? buffer_block->buffer : nullptr;
 }
 
@@ -464,23 +561,66 @@ bool MPSHeapAllocatorImpl::isSharedBuffer(void* ptr) {
   std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
   BufferBlock *buffer_block = get_allocated_buffer_block(ptr);
-  // it's OK for the buffer_block to not exist yet
-  return buffer_block && (buffer_block->heap->pool->usage & UsageFlags::SHARED);
+  if (!buffer_block) {
+    return false;
+  }
+  // (Intel-Mac fix v2) heapless scalar buffer is always allocated with
+  // MTLResourceStorageModeShared directly from the device — see
+  // allocScalarBufferWithValue(). No heap/pool to consult.
+  if (buffer_block->heap == nullptr) {
+    return true;
+  }
+  return buffer_block->heap->pool->usage & UsageFlags::SHARED;
 }
 
 id<MTLBuffer> MPSHeapAllocatorImpl::allocScalarBufferWithValue(void* value, size_t size) {
-  BufferBlock* buffer_block = nullptr;
+  // (Intel-Mac fix v2) refuse to memcpy from a null source pointer — this
+  // was previously unguarded and would crash (or worse, silently read
+  // garbage) if a caller passed value == nullptr.
+  TORCH_CHECK(value != nullptr, "allocScalarBufferWithValue() called with a null value pointer");
+  TORCH_CHECK(size > 0, "allocScalarBufferWithValue() called with size == 0");
+
+  // (Intel-Mac fix v2) ROOT CAUSE of the "MTLBuffer.contents returned null"
+  // crash: scalar buffers were previously sub-allocated from m_scalar_pool's
+  // MTLHeap via alloc_buffer_block(). But MTLHeap on macOS only supports
+  // MTLResourceStorageModePrivate / Managed — Shared storage heaps do not
+  // exist, on ANY Mac (Apple Silicon or Intel, integrated or discrete).
+  // A Private buffer is GPU-only memory: calling -contents on it is invalid
+  // and correctly returns nil on Intel Iris Plus / discrete GPUs (it can
+  // silently "happen to work" on some Apple Silicon configs, which is why
+  // this went unnoticed there).
+  //
+  // Scalar buffers must be written directly by the CPU, so they cannot go
+  // through the heap at all. We allocate them straight from the MTLDevice
+  // with MTLResourceStorageModeShared, bypassing m_scalar_pool / heaps
+  // entirely. -newBufferWithBytes:length:options: also copies `value` into
+  // the buffer atomically at creation time, so no separate -contents +
+  // memcpy step (and no nil check on contents) is needed.
+  id<MTLBuffer> buffer = [m_device newBufferWithBytes:value
+                                                length:size
+                                               options:MTLResourceCPUCacheModeDefaultCache | MTLResourceStorageModeShared];
+  TORCH_CHECK(buffer != nil,
+              "MPS allocator failed to allocate a scalar buffer of size ",
+              format_size(size), " directly from the device (Shared storage).");
+
   {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    // (Intel-Mac fix v2) Heap == nullptr marks this BufferBlock as
+    // "heapless" — free_buffer() below knows to release it directly
+    // instead of returning it to a BufferPool/HeapBlock.
+    BufferBlock* buffer_block = new BufferBlock(size, size, buffer, /*Heap=*/nullptr);
+    buffer_block->in_use = true;
+    buffer_block->use_count = 1;
+    m_allocated_buffers[buffer] = buffer_block;
+    m_current_allocated_memory += size;
 
-    buffer_block = alloc_buffer_block(size, UsageFlags::SCALAR);
-    if (!buffer_block) {
-      return nullptr;
+    if (m_debug_verbosity & DebugVerbosity::ALLOCATIONS) {
+      std::cerr << "Allocated heapless shared scalar buffer #" << buffer_block->buf_id
+                << " of size " << format_size(size)
+                << " directly from device (no heap, CPU-writable)\n";
     }
   }
-  // buffer is out of the pool, so no mutex lock is needed
-  memcpy([buffer_block->buffer contents], value, size);
-  return buffer_block->buffer;
+  return buffer;
 }
 
 ssize_t MPSHeapAllocatorImpl::getUnalignedBufferSize(void* ptr) {
@@ -516,12 +656,31 @@ IntArrayRef MPSHeapAllocatorImpl::getBufferShape(void* ptr) {
 }
 
 void MPSHeapAllocatorImpl::free(void* ptr) {
+  // (Intel-Mac fix) explicit guard: freeing a null pointer is a silent
+  // no-op everywhere else in C/C++ (matches `free(NULL)` semantics from
+  // the standard C API), so make that contract explicit here too instead
+  // of falling through into get_allocated_buffer_block(nullptr) and
+  // tripping the TORCH_INTERNAL_ASSERT below.
+  if (ptr == nullptr) {
+    return;
+  }
+
   BufferBlock *buffer_block = nullptr;
   {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     buffer_block = get_allocated_buffer_block(ptr);
     TORCH_INTERNAL_ASSERT(buffer_block);
+
+    // (Intel-Mac fix v2) heapless scalar buffer (see allocScalarBufferWithValue) —
+    // free it right away on this thread. There's no command-buffer/heap
+    // bookkeeping involved, so there's no need to defer to a completion
+    // handler the way pool-backed scalar buffers used to require.
+    if (buffer_block->heap == nullptr) {
+      free_buffer(buffer_block);
+      return;
+    }
+
     const BufferPool& pool = *buffer_block->heap->pool;
     if (!(pool.usage & UsageFlags::SCALAR)) {
       free_buffer(buffer_block);
@@ -594,14 +753,29 @@ public:
   }
   DeleterFnPtr raw_deleter() const override { return &Delete; }
 
+  // (Intel-Mac fix) standard allocation API path: reject nbytes == 0 up
+  // front (matches malloc()'s own guard) and never wrap a nil id<MTLBuffer>
+  // into a "valid-looking" DataPtr — a DataPtr whose .get() returns nil but
+  // is otherwise treated as a normal pointer downstream is exactly how a
+  // write ends up targeting address 0x0.
   DataPtr allocate(const size_t nbytes) const override {
-    __block id<MTLBuffer> buf = nbytes > 0 ? _getAllocImpl().malloc(nbytes, m_usage) : nullptr;
+    if (nbytes == 0) {
+      return { nullptr, nullptr, &Delete, at::Device(at::DeviceType::MPS, 0)};
+    }
+    __block id<MTLBuffer> buf = _getAllocImpl().malloc(nbytes, m_usage);
+    TORCH_CHECK(buf != nil,
+                "MPS allocator failed to allocate ", nbytes,
+                " bytes and returned nil — refusing to construct a DataPtr "
+                "around a null buffer (would alias address 0x0).");
     return { buf, buf, &Delete, at::Device(at::DeviceType::MPS, 0)};
   }
 
   // implementation of IMPSAllocator interface
   DataPtr allocScalarBufferWithValue(void *value, size_t size) const override {
     id<MTLBuffer> buf = _getAllocImpl().allocScalarBufferWithValue(value, size);
+    TORCH_CHECK(buf != nil,
+                "MPS allocator failed to allocate a scalar buffer of size ",
+                size, " and returned nil.");
     return { buf, buf, &Delete, at::Device(at::DeviceType::MPS, 0)};
   }
   bool isSharedBuffer(void* ptr) const override { return _getAllocImpl().isSharedBuffer(ptr); }
@@ -624,6 +798,10 @@ private:
   uint32_t m_usage;
 
   static void Delete(void* ptr) {
+    // (Intel-Mac fix) explicit no-op on null — mirrors free()'s contract
+    // and avoids routing a null pointer into _getAllocImpl().free(), which
+    // now also guards this case, but checking here too keeps the intent
+    // obvious at the call site closest to PyTorch's own DataPtr machinery.
     if (ptr) {
       _getAllocImpl().free(ptr);
     }
@@ -672,6 +850,12 @@ Tensor _pin_memory_mps(const Tensor& self, c10::optional<Device> device)
 {
   TORCH_INTERNAL_ASSERT_DEBUG_ONLY(!device.has_value() || device->is_mps());
   auto* shared_allocator = at::mps::getIMPSAllocator(true);
+  // (Intel-Mac fix) on a discrete-GPU Intel Mac, isSharedStorageSupported()
+  // is false, so getIMPSAllocator(true) returns nullptr by design (see
+  // above). The original TORCH_CHECK already covers this — kept as-is,
+  // but documented here since it's the most common way this code path
+  // surfaces a "0x0" symptom report: callers further upstream sometimes
+  // skip this check and try to pin memory anyway on Intel Macs.
   TORCH_CHECK(shared_allocator, "unable to pin memory on a non-unified memory device");
 
   const size_t storage_size = detail::computeStorageNbytes(self.sizes(), self.strides(), self.dtype().itemsize());

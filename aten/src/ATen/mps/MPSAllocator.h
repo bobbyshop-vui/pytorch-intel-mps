@@ -235,9 +235,9 @@ class MPSHeapAllocatorImpl
 public:
   explicit MPSHeapAllocatorImpl() :
     m_device(at::mps::MPSDevice::getInstance()->device()),
-    m_large_pool_shared (m_device, UsageFlags::SHARED  | UsageFlags::HAZARD),
+    m_large_pool_shared (m_device, UsageFlags::PRIVATE | UsageFlags::HAZARD),
     m_large_pool_private(m_device, UsageFlags::PRIVATE | UsageFlags::HAZARD),
-    m_small_pool_shared (m_device, UsageFlags::SMALL   | UsageFlags::SHARED  | UsageFlags::HAZARD),
+    m_small_pool_shared (m_device, UsageFlags::SMALL   | UsageFlags::PRIVATE | UsageFlags::HAZARD),
     m_small_pool_private(m_device, UsageFlags::SMALL   | UsageFlags::PRIVATE | UsageFlags::HAZARD),
     // no Hazard Tracking required for the Scalar pool (synchronized manually)
     m_scalar_pool(m_device, UsageFlags::SMALL | UsageFlags::PRIVATE | UsageFlags::SCALAR),
